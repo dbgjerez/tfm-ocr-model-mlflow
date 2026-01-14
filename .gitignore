@@ -1,0 +1,7 @@
+synthetic_chars
+fonts
+mlruns
+.ipynb_checkpoints
+__pycache__/
+*.pyc
+artifacts/

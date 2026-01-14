@@ -1,0 +1,12 @@
+name: ocr-model
+
+entry_points:
+  main:
+    command: "python steps/data.py"
+
+steps:
+  datos:
+    path: steps/data.py
+  modelado:
+    path: steps/train.py
+    depends_on: datos
