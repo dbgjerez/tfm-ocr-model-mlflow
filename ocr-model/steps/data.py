@@ -58,7 +58,7 @@ class CharsDataset(Dataset):
 # ============================================================
 # FUNCIONES DE DATA
 # ============================================================
-def recoleccion_datos(dataset_dir: str):
+def recoleccion_datos(dataset_dir: str) -> pd.DataFrame:
     rows = []
     samples = sorted(os.listdir(dataset_dir))
 
@@ -67,27 +67,40 @@ def recoleccion_datos(dataset_dir: str):
             continue
 
         try:
-            num = int(sample.replace("Sample", ""))
+            sample_num = int(sample.replace("Sample", ""))
         except ValueError:
-            continue
-
-        if 1 <= num <= 10:
-            label = str(num - 1)
-        elif 11 <= num <= 36:
-            label = chr(ord("A") + (num - 11))
-        else:
             continue
 
         folder = os.path.join(dataset_dir, sample)
         for fname in os.listdir(folder):
             if fname.lower().endswith(".png"):
-                rows.append({"path": os.path.join(sample, fname), "label": label})
+                rows.append({
+                    "path": os.path.join(sample, fname),
+                    "sample": sample,
+                    "sample_num": sample_num
+                })
 
     return pd.DataFrame(rows)
 
 
-def limpieza_datos(df: pd.DataFrame):
-    return df.copy()
+def limpieza_datos(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    def map_label(sample_num: int):
+        if 1 <= sample_num <= 10:
+            return str(sample_num - 1)
+        elif 11 <= sample_num <= 36:
+            return chr(ord("A") + (sample_num - 11))
+        else:
+            return None  # minúsculas u otros símbolos
+
+    df["label"] = df["sample_num"].apply(map_label)
+
+    # filtrado final
+    df = df[df["label"].notnull()].reset_index(drop=True)
+
+    return df
+
 
 
 def transformacion_y_enriquecimiento(df: pd.DataFrame, out_dir: Path):
