@@ -1,5 +1,7 @@
 import mlflow
 import torch
+from torch.amp import autocast
+from torch.amp import GradScaler
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -136,7 +138,7 @@ def train_one_epoch(model, loader, device, opt, crit, scaler=None, use_amp=False
         opt.zero_grad(set_to_none=True)
 
         if use_amp:
-            with torch.cuda.amp.autocast(enabled=True):
+            with autocast("cuda", enabled=use_amp):
                 out = model(imgs)
                 loss = crit(out, labels)
             scaler.scale(loss).backward()
@@ -254,146 +256,145 @@ class TrainConfig:
 # TRAIN MAIN (single run)
 # ===========================================================
 def train_main(config: TrainConfig):
-    with mlflow.start_run(run_name="train", nested=True):
-        mlflow.log_params(vars(config))
+    mlflow.log_params(vars(config))
 
-        # Data
-        train_ds, val_ds = preparar_dataset(CSV_PATH, val_split=config.val_split, seed=config.seed)
-        train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True)
-        val_loader = DataLoader(val_ds, batch_size=config.batch)
+    # Data
+    train_ds, val_ds = preparar_dataset(CSV_PATH, val_split=config.val_split, seed=config.seed)
+    train_loader = DataLoader(train_ds, batch_size=config.batch, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=config.batch)
 
-        # Model
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = BetterCNN().to(device)
+    # Model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = BetterCNN().to(device)
 
-        crit = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
-        opt = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)
+    crit = nn.CrossEntropyLoss(label_smoothing=config.label_smoothing)
+    opt = optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)
 
-        use_amp = (device == "cuda")
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    use_amp = (device == "cuda")
+    scaler = GradScaler("cuda", enabled=use_amp)
 
-        best_score = -1.0
-        best_state = None
-        best_epoch = -1
-        bad_epochs = 0
+    best_score = -1.0
+    best_state = None
+    best_epoch = -1
+    bad_epochs = 0
 
-        history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
 
-        last_y_true, last_y_pred = None, None
+    last_y_true, last_y_pred = None, None
 
-        for ep in range(config.epochs):
-            t0 = time.time()
+    for ep in range(config.epochs):
+        t0 = time.time()
 
-            tr_loss, tr_acc = train_one_epoch(
-                model, train_loader, device, opt, crit,
-                scaler=scaler, use_amp=use_amp, grad_clip=config.grad_clip
-            )
-
-            val_loss, y_true, y_pred, y_prob = validar(model, val_loader, device, crit)
-            metrics = compute_metrics(y_true, y_pred, y_prob, NUM_CLASSES)
-
-            # history
-            history["train_loss"].append(tr_loss)
-            history["train_acc"].append(tr_acc)
-            history["val_loss"].append(val_loss)
-            history["val_acc"].append(metrics["val_acc"])
-
-            # log
-            mlflow.log_metric("train_loss", tr_loss, step=ep)
-            mlflow.log_metric("train_acc", tr_acc, step=ep)
-            mlflow.log_metric("val_loss", val_loss, step=ep)
-            for k, v in metrics.items():
-                mlflow.log_metric(k, float(v), step=ep)
-
-            mlflow.log_metric("lr", float(opt.param_groups[0]["lr"]), step=ep)
-            mlflow.log_metric("epoch_time_s", float(time.time() - t0), step=ep)
-
-            score = metrics["val_f1_macro"]
-            scheduler.step(score)
-
-            print(
-                f"[Epoch {ep}] tr_acc={tr_acc:.3f} "
-                f"val_acc={metrics['val_acc']:.3f} val_f1m={metrics['val_f1_macro']:.3f} "
-                f"top3={metrics['val_top3_acc']:.3f} lr={opt.param_groups[0]['lr']:.2e}"
-            )
-
-            improved = score > (best_score + 1e-6)
-            
-            if improved:
-                best_score = score
-                best_epoch = ep
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                bad_epochs = 0
-                print(
-                    f"[Epoch {ep}] ✅ Improved val_f1_macro={best_score:.4f} "
-                    f"(val_acc={metrics['val_acc']:.4f})"
-                )
-            else:
-                bad_epochs += 1
-                print(
-                    f"[Epoch {ep}] ❌ No improvement: val_f1_macro={score:.4f} "
-                    f"(best={best_score:.4f} @ epoch {best_epoch}) "
-                    f"| no_improve={bad_epochs}/{config.patience}"
-                )
-            
-                if bad_epochs >= config.patience:
-                    print(
-                        f"🛑 Early stopping. Best val_f1_macro={best_score:.4f} "
-                        f"at epoch {best_epoch}. Stopped at epoch {ep}."
-                    )
-                    mlflow.log_param("early_stopping_triggered", True)
-                    mlflow.log_param("early_stopped_epoch", int(ep))
-                    mlflow.log_param("best_epoch", int(best_epoch))
-                    mlflow.log_metric("best_val_f1_macro", float(best_score))
-                    mlflow.log_metric("no_improve_epochs", int(bad_epochs))
-                    last_y_true, last_y_pred = y_true, y_pred
-                    break
-
-            last_y_true, last_y_pred = y_true, y_pred
-
-        # Restore best
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        # Artifacts
-        out_dir = Path("artifacts/modelado")
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        # curves
-        curves_dir = out_dir / "curves"
-        loss_path, acc_path = guardar_curvas(history, curves_dir)
-        mlflow.log_artifact(str(loss_path))
-        mlflow.log_artifact(str(acc_path))
-
-        # confusion matrices
-        cm_path = guardar_confusion(last_y_true, last_y_pred, out_dir / "confusion_matrix.png", normalize=False)
-        cmn_path = guardar_confusion(last_y_true, last_y_pred, out_dir / "confusion_matrix_norm.png", normalize=True)
-        mlflow.log_artifact(str(cm_path))
-        mlflow.log_artifact(str(cmn_path))
-
-        # classification report
-        cr_path = guardar_classification_report(last_y_true, last_y_pred, out_dir / "classification_report.txt")
-        mlflow.log_artifact(str(cr_path))
-
-        # Log model
-        input_example_tensor = torch.zeros((1, 1, 32, 32), device=device)
-        input_example = input_example_tensor.detach().cpu().numpy()
-        pred_example = model(input_example_tensor).detach().cpu().numpy()
-        signature = infer_signature(input_example, pred_example)
-
-        mlflow.pytorch.log_model(
-            pytorch_model=model,
-            name="ocr-model",
-            signature=signature,
-            input_example=input_example,
+        tr_loss, tr_acc = train_one_epoch(
+            model, train_loader, device, opt, crit,
+            scaler=scaler, use_amp=use_amp, grad_clip=config.grad_clip
         )
 
-        # final metric for convenience
-        mlflow.log_param("best_epoch", int(best_epoch))
-        mlflow.log_metric("best_val_f1_macro", float(best_score))
+        val_loss, y_true, y_pred, y_prob = validar(model, val_loader, device, crit)
+        metrics = compute_metrics(y_true, y_pred, y_prob, NUM_CLASSES)
+
+        # history
+        history["train_loss"].append(tr_loss)
+        history["train_acc"].append(tr_acc)
+        history["val_loss"].append(val_loss)
+        history["val_acc"].append(metrics["val_acc"])
+
+        # log
+        mlflow.log_metric("train_loss", tr_loss, step=ep)
+        mlflow.log_metric("train_acc", tr_acc, step=ep)
+        mlflow.log_metric("val_loss", val_loss, step=ep)
+        for k, v in metrics.items():
+            mlflow.log_metric(k, float(v), step=ep)
+
+        mlflow.log_metric("lr", float(opt.param_groups[0]["lr"]), step=ep)
+        mlflow.log_metric("epoch_time_s", float(time.time() - t0), step=ep)
+
+        score = metrics["val_f1_macro"]
+        scheduler.step(score)
+
+        print(
+            f"[Epoch {ep}] tr_acc={tr_acc:.3f} "
+            f"val_acc={metrics['val_acc']:.3f} val_f1m={metrics['val_f1_macro']:.3f} "
+            f"top3={metrics['val_top3_acc']:.3f} lr={opt.param_groups[0]['lr']:.2e}"
+        )
+
+        improved = score > (best_score + 1e-6)
         
-        return model, float(best_score), int(best_epoch)
+        if improved:
+            best_score = score
+            best_epoch = ep
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            bad_epochs = 0
+            print(
+                f"[Epoch {ep}] ✅ Improved val_f1_macro={best_score:.4f} "
+                f"(val_acc={metrics['val_acc']:.4f})"
+            )
+        else:
+            bad_epochs += 1
+            print(
+                f"[Epoch {ep}] ❌ No improvement: val_f1_macro={score:.4f} "
+                f"(best={best_score:.4f} @ epoch {best_epoch}) "
+                f"| no_improve={bad_epochs}/{config.patience}"
+            )
+        
+            if bad_epochs >= config.patience:
+                print(
+                    f"🛑 Early stopping. Best val_f1_macro={best_score:.4f} "
+                    f"at epoch {best_epoch}. Stopped at epoch {ep}."
+                )
+                mlflow.log_param("early_stopping_triggered", True)
+                mlflow.log_param("early_stopped_epoch", int(ep))
+                mlflow.log_param("best_epoch", int(best_epoch))
+                mlflow.log_metric("best_val_f1_macro", float(best_score))
+                mlflow.log_metric("no_improve_epochs", int(bad_epochs))
+                last_y_true, last_y_pred = y_true, y_pred
+                break
+
+        last_y_true, last_y_pred = y_true, y_pred
+
+    # Restore best
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    # Artifacts
+    out_dir = Path("artifacts/modelado")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # curves
+    curves_dir = out_dir / "curves"
+    loss_path, acc_path = guardar_curvas(history, curves_dir)
+    mlflow.log_artifact(str(loss_path))
+    mlflow.log_artifact(str(acc_path))
+
+    # confusion matrices
+    cm_path = guardar_confusion(last_y_true, last_y_pred, out_dir / "confusion_matrix.png", normalize=False)
+    cmn_path = guardar_confusion(last_y_true, last_y_pred, out_dir / "confusion_matrix_norm.png", normalize=True)
+    mlflow.log_artifact(str(cm_path))
+    mlflow.log_artifact(str(cmn_path))
+
+    # classification report
+    cr_path = guardar_classification_report(last_y_true, last_y_pred, out_dir / "classification_report.txt")
+    mlflow.log_artifact(str(cr_path))
+
+    # Log model
+    input_example_tensor = torch.zeros((1, 1, 32, 32), device=device)
+    input_example = input_example_tensor.detach().cpu().numpy()
+    pred_example = model(input_example_tensor).detach().cpu().numpy()
+    signature = infer_signature(input_example, pred_example)
+
+    mlflow.pytorch.log_model(
+        pytorch_model=model,
+        name="ocr-model",
+        signature=signature,
+        input_example=input_example,
+    )
+
+    # final metric for convenience
+    mlflow.log_param("best_epoch", int(best_epoch))
+    mlflow.log_metric("best_val_f1_macro", float(best_score))
+    
+    return model, float(best_score), int(best_epoch)
 
 
 
@@ -409,7 +410,7 @@ def build_objective(
     def objective(trial):
         cfg = TrainConfig(
             epochs=epochs,
-            batch=trial.suggest_categorical("batch", [32, 64, 128]),
+            batch=trial.suggest_categorical("batch", [32, 64, 128, 256]),
             lr=trial.suggest_float("lr", 1e-4, 3e-3, log=True),
             weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True),
             patience=patience,
@@ -433,7 +434,7 @@ def main(
     n_trials=20,
     study_name="ocr-hpo",
     epochs=60,
-    patience=8,
+    patience=5,
     val_split=0.2,
     seed=42,
 ):
